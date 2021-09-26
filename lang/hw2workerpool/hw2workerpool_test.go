@@ -21,8 +21,10 @@ func TestWorkerPoolOnAdd(t *testing.T) {
 	fmt.Println("start jobs")
 	for i := 0; i < 5; i++ {
 		jobs <- func(results chan interface{}) {
+			fmt.Println("start")
 			time.Sleep(time.Second * 4)
 			results <- struct{}{}
+			fmt.Println("stop")
 		}
 	}
 	time.Sleep(time.Second)

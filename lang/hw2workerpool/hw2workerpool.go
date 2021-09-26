@@ -28,6 +28,7 @@ func StartWorkerPool(count int, jobs chan func(results chan interface{}), result
 	go func(wp *WorkerPool) {
 		for {
 			wp.lock.Lock()
+			needSleep := false
 			select {
 			case <-ctx.Done():
 				return
@@ -36,7 +37,6 @@ func StartWorkerPool(count int, jobs chan func(results chan interface{}), result
 			bufChan := wp.bufChan
 			resync := wp.resync
 			ctx := wp.ctx
-			wp.lock.Unlock()
 			select {
 			case bufChan <- struct{}{}:
 				select {
@@ -63,13 +63,21 @@ func StartWorkerPool(count int, jobs chan func(results chan interface{}), result
 						j(wp.results)
 					}()
 				case <-ctx.Done():
+					wp.lock.Unlock()
 					return
 				default:
+					<-bufChan
 				}
 			case <-ctx.Done():
+				wp.lock.Unlock()
 				return
 			default:
-				time.Sleep(time.Second * 1)
+				needSleep = true
+			}
+			wp.lock.Unlock()
+			if needSleep {
+				needSleep = false
+				time.Sleep(time.Second)
 			}
 		}
 	}(wp)
