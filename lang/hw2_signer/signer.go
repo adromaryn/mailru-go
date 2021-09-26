@@ -82,7 +82,7 @@ func MultiHash(in chan interface{}, out chan interface{}) {
 		go func(data string) {
 			defer wg.Done()
 
-			inCrc32 := make(chan ordered, 6)
+			inCrc32 := make(chan ordered)
 			outCrc32 := make(chan ordered)
 
 			for i := 0; i <= 5; i++ {
