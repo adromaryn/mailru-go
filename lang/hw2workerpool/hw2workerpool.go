@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"time"
 )
 
 type WorkerPool struct {
@@ -28,7 +27,6 @@ func StartWorkerPool(count int, jobs chan func(results chan interface{}), result
 	go func(wp *WorkerPool) {
 		for {
 			wp.lock.Lock()
-			needSleep := false
 			select {
 			case <-ctx.Done():
 				return
@@ -72,13 +70,8 @@ func StartWorkerPool(count int, jobs chan func(results chan interface{}), result
 				wp.lock.Unlock()
 				return
 			default:
-				needSleep = true
 			}
 			wp.lock.Unlock()
-			if needSleep {
-				needSleep = false
-				time.Sleep(time.Second)
-			}
 		}
 	}(wp)
 
