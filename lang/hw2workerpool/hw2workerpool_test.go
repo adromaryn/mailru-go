@@ -85,7 +85,7 @@ func TestWorkerPoolOnDec(t *testing.T) {
 
 	fmt.Println("dec workers")
 	wp.DecWorkers(3)
-	time.Sleep(time.Second * 4)
+	time.Sleep(time.Second * 3)
 	fmt.Println("next 2 jobs processing")
 	if wp.Size() != 2 {
 		t.Errorf("capacity of decremented worker pool wrong: %v", wp.Size())
