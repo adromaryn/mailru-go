@@ -1,13 +1,13 @@
 package main
 
 import (
-	"encoding/json"
+	"bufio"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"regexp"
-	"strings"
+
+	"github.com/mailru/easyjson"
 
 	"github.com/adromaryn/mailru-go/lang/hw3_bench/structs"
 )
@@ -19,10 +19,7 @@ func FastSearch(out io.Writer) {
 		panic(err)
 	}
 
-	fileContents, err := ioutil.ReadAll(file)
-	if err != nil {
-		panic(err)
-	}
+	r := bufio.NewReader(file)
 
 	emailSplitterRegex := regexp.MustCompile("@")
 	androidRegex := regexp.MustCompile("Android")
@@ -31,17 +28,26 @@ func FastSearch(out io.Writer) {
 	uniqueBrowsers := 0
 	foundUsers := ""
 
-	lines := strings.Split(string(fileContents), "\n")
-
 	users := make([]structs.UserData, 0)
-	for _, line := range lines {
+	for {
+		s, err := r.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			panic(err)
+		}
+		if len(s) == 0 && err == io.EOF {
+			break
+		}
 		user := &structs.UserData{}
 		// fmt.Printf("%v %v\n", err, line)
-		err := json.Unmarshal([]byte(line), user)
-		if err != nil {
+		err2 := easyjson.Unmarshal([]byte(s), user)
+		if err2 != nil {
 			panic(err)
 		}
 		users = append(users, *user)
+
+		if err == io.EOF {
+			break
+		}
 	}
 
 	for i, user := range users {
