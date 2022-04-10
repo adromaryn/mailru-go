@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -8,34 +9,35 @@ import (
 	"log"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 )
 
 const (
 	requiredCode = `
-	if %v.%v == %v {
-		return false
+	if s.%v == %v {
+		return errors.New("%v must be a empty")
 	}
 
 `
 	minIntCode = `
-	if %v.%v < %v {
-		return false
+	if s.%v < %v {
+		return errors.New("%v must be >= %v")
 	}
 
 `
 
 	minStrCode = `
-	if len(%v.%v) < %v {
-		return false
+	if len(s.%v) < %v {
+		return errors.New("%v len must be >= %v")
 	}
 
 `
 
 	maxIntCode = `
-	if %v.%v > %v {
-		return false
+	if s.%v > %v {
+		return errors.New("%v must be >= %v")
 	}
 
 `
@@ -45,6 +47,21 @@ const (
 	}
 `
 )
+
+var matchFirstCap = regexp.MustCompile("(.)([A-Z][a-z]+)")
+var matchAllCap = regexp.MustCompile("([a-z0-9])([A-Z])")
+
+type ApiDefinition struct {
+	Url    string `json:"url"`
+	Method string `json:"method"`
+	Auth   bool   `json:"auth"`
+}
+
+type MethodDefinition struct {
+	Auth      bool
+	ParamName string
+	FuncName  string
+}
 
 func main() {
 	fset := token.NewFileSet()
@@ -60,11 +77,59 @@ func main() {
 
 	imports := map[string]interface{}{}
 	imports["net/http"] = true
-	body := ""
+	paramsBody := ""
+	// [type]->[url]->[method]->has_auth
+	apiMethodDecls := make(map[string]map[string]map[string]MethodDefinition)
+SPECS_LOOP:
 	for _, topDecl := range node.Decls {
 		switch declT := topDecl.(type) {
 		case *ast.FuncDecl:
-			continue
+			funcNode := topDecl.(*ast.FuncDecl)
+			if funcNode.Doc == nil {
+				fmt.Printf("SKIP function %#v does not have comments\n", funcNode.Name.Name)
+				continue SPECS_LOOP
+			}
+
+			needCodegen := false
+			var apiDefinition *ApiDefinition
+			for _, comment := range funcNode.Doc.List {
+				if strings.HasPrefix(comment.Text, "// apigen:api") {
+					needCodegen = true
+					definitionStr := strings.TrimSpace(strings.TrimPrefix(comment.Text, "// apigen:api"))
+					json.Unmarshal([]byte(definitionStr), &apiDefinition)
+					break
+				}
+			}
+			if !needCodegen {
+				fmt.Printf("SKIP function %#v doesnt have apigen mark\n", funcNode.Name.Name)
+				continue SPECS_LOOP
+			}
+
+			funcRecv := funcNode.Recv
+			if funcRecv == nil {
+				log.Fatalln("only methods for apigen")
+			}
+			star, ok := funcRecv.List[0].Type.(*ast.StarExpr)
+			if !ok {
+				log.Fatalln("api method receiver isnt pointer")
+			}
+			receiverTypeName := star.X.(*ast.Ident).Name
+
+			if len(funcNode.Type.Params.List) != 2 {
+				log.Fatalln("should has ctx and 'Params' args")
+			}
+			paramName := funcNode.Type.Params.List[1].Type.(*ast.Ident).Name
+
+			if apiMethodDecls[receiverTypeName] == nil {
+				apiMethodDecls[receiverTypeName] = make(map[string]map[string]MethodDefinition)
+			}
+			if apiMethodDecls[receiverTypeName][apiDefinition.Url] == nil {
+				apiMethodDecls[receiverTypeName][apiDefinition.Url] = make(map[string]MethodDefinition)
+			}
+			apiMethodDecls[receiverTypeName][apiDefinition.Url][apiDefinition.Method] = MethodDefinition{apiDefinition.Auth, paramName, funcNode.Name.Name}
+
+			imports["context"] = true
+
 		case *ast.GenDecl:
 			genNode := topDecl.(*ast.GenDecl)
 			for _, spec := range genNode.Specs {
@@ -83,7 +148,7 @@ func main() {
 				structName := currType.Name.Name
 				parseTemplate := fmt.Sprintf("func paramsParse%v(r *http.Request) (*%v, error) {\n", structName, structName)
 				parseTemplate += fmt.Sprintf("	resStruct := &%v{}\n", structName)
-				validateTemplate := fmt.Sprintf("func (s *%v) Validate() bool {\n", structName)
+				validateTemplate := fmt.Sprintf("func (s *%v) Validate() error {\n", structName)
 				isParamsStruct := false
 			FIELDS_LOOP:
 				for _, field := range currStruct.Fields.List {
@@ -96,17 +161,43 @@ func main() {
 						isParamsStruct = true
 
 						apiValidateOpts := strings.Split(apiValidateStr, ",")
+						hasErrParse := false
 						for _, opt := range apiValidateOpts {
 							fieldType := field.Type.(*ast.Ident).Name
 							if fieldType != "int" && fieldType != "string" {
 								log.Fatalln("unsupported", fieldType)
 							}
 
+							paramName := toSnakeCase(field.Names[0].Name)
+							if fieldType == "int" {
+								if !hasErrParse {
+									parseTemplate += fmt.Sprintf("\n	var err error\n")
+								}
+								parseTemplate += fmt.Sprintf(
+									"	resStruct.%v, err = strconv.Atoi(r.FormValue(\"%v\"))\n",
+									field.Names[0].Name, paramName,
+								)
+								parseTemplate += fmt.Sprintf(`	if err != nil {
+		return nil, errors.New("%v must be int")
+	}
+`, paramName)
+								imports["strconv"] = true
+								imports["errors"] = true
+								hasErrParse = true
+							} else {
+
+								parseTemplate += fmt.Sprintf(
+									"	resStruct.%v = r.FormValue(\"%v\")\n",
+									field.Names[0].Name, paramName,
+								)
+							}
+
 							if opt == "required" {
+								imports["errors"] = true
 								if fieldType == "int" {
-									validateTemplate += fmt.Sprintf(requiredCode, "s", field.Names[0].Name, 0)
+									validateTemplate += fmt.Sprintf(requiredCode, field.Names[0].Name, 0, paramName)
 								} else {
-									validateTemplate += fmt.Sprintf(requiredCode, "s", field.Names[0].Name, `""`)
+									validateTemplate += fmt.Sprintf(requiredCode, field.Names[0].Name, `""`, paramName)
 								}
 								continue FIELDS_LOOP
 							}
@@ -117,6 +208,7 @@ func main() {
 							}
 
 							if parsedOpt[0] == "enum" {
+								imports["errors"] = true
 								enumList := strings.Split(parsedOpt[1], "|")
 								conditionList := []string{}
 								if fieldType == "int" {
@@ -131,7 +223,8 @@ func main() {
 									}
 								}
 								validateTemplate += fmt.Sprintf("	if %v {\n", strings.Join(conditionList, " && "))
-								validateTemplate += fmt.Sprintf("		return false\n	}\n\n")
+								validateTemplate += fmt.Sprintf("		return errors.New(\"%v must be one of [%v]\")\n	}\n\n", paramName, strings.Join(enumList, ", "))
+								continue FIELDS_LOOP
 							}
 
 							if parsedOpt[0] == "min" {
@@ -139,11 +232,13 @@ func main() {
 									log.Fatalln("min should be integer")
 								}
 
+								imports["errors"] = true
 								if fieldType == "int" {
-									validateTemplate += fmt.Sprintf(minIntCode, "s", field.Names[0].Name, parsedOpt[1])
+									validateTemplate += fmt.Sprintf(minIntCode, field.Names[0].Name, parsedOpt[1], paramName, parsedOpt[1])
 								} else {
-									validateTemplate += fmt.Sprintf(minStrCode, "s", field.Names[0].Name, parsedOpt[1])
+									validateTemplate += fmt.Sprintf(minStrCode, field.Names[0].Name, parsedOpt[1], paramName, parsedOpt[1])
 								}
+								continue FIELDS_LOOP
 							}
 
 							if parsedOpt[0] == "max" {
@@ -152,10 +247,11 @@ func main() {
 								}
 
 								if fieldType == "int" {
-									validateTemplate += fmt.Sprintf(maxIntCode, "s", field.Names[0].Name, parsedOpt[1])
+									validateTemplate += fmt.Sprintf(maxIntCode, field.Names[0].Name, parsedOpt[1], paramName, parsedOpt[1])
 								} else {
 									log.Fatalln("max validator only for int params")
 								}
+								continue FIELDS_LOOP
 							}
 						}
 					}
@@ -164,10 +260,10 @@ func main() {
 				if isParamsStruct {
 					parseTemplate += "	return resStruct, nil\n"
 					parseTemplate += "}\n\n"
-					body += parseTemplate
-					validateTemplate += "	return true\n"
+					paramsBody += parseTemplate
+					validateTemplate += "	return nil\n"
 					validateTemplate += "}\n\n"
-					body += validateTemplate
+					paramsBody += validateTemplate
 				}
 			}
 		default:
@@ -175,6 +271,7 @@ func main() {
 			continue
 		}
 	}
+
 	if len(imports) > 0 {
 		fmt.Fprint(out, "import (\n")
 		for k := range imports {
@@ -182,5 +279,96 @@ func main() {
 		}
 		fmt.Fprint(out, ")\n\n")
 	}
-	fmt.Fprint(out, body)
+
+	fmt.Fprint(out, paramsBody)
+	fmt.Fprint(out, parseApiDecls(&apiMethodDecls))
+}
+
+func parseApiDecls(apiMethodDecls *map[string]map[string]map[string]MethodDefinition) string {
+	result := ""
+	for apiName := range *apiMethodDecls {
+		result += fmt.Sprintf("func (h *%v) ServeHTTP(w http.ResponseWriter, r *http.Request) {\n", apiName)
+		result += `
+	switch r.URL.Path {`
+
+		urlDecls := (*apiMethodDecls)[apiName]
+		for url := range urlDecls {
+			result += fmt.Sprintf(`
+	case %#v:`, url)
+			methodDecls := urlDecls[url]
+			result += parseMethodsDecls(&methodDecls)
+		}
+		result += `
+	default:
+		http.Error(w, "unknown method", http.StatusNotFound)
+	}
+
+}
+
+`
+	}
+	return result
+}
+
+func parseMethodsDecls(methodDecls *map[string]MethodDefinition) string {
+	result := ""
+	if len(*methodDecls) == 1 {
+		var method string
+		for method = range *methodDecls {
+		}
+		if method != "" {
+			result += fmt.Sprintf(`
+		if r.Method != %#v {
+			http.Error(w, "bad method", http.StatusNotAcceptable)
+		}
+`, method)
+			result += parseMethod((*methodDecls)[method])
+		}
+	} else {
+		result += fmt.Sprintf(`
+		switch r.Method {
+`)
+		for method, methodDef := range *methodDecls {
+			if method == "" {
+				continue
+			}
+
+			result += fmt.Sprintf(`
+		case %v:
+`, method)
+			result += parseMethod(methodDef)
+		}
+
+		if methodDef, ok := (*methodDecls)[""]; ok {
+			result += fmt.Sprintf(`
+		default:
+`)
+			result += parseMethod(methodDef)
+		}
+	}
+	return result
+}
+
+func parseMethod(method MethodDefinition) string {
+	result := ""
+	if method.Auth {
+		result += `
+		if r.Header.Get("X-Auth") != "100500" {
+			http.Error(w, "unauthorized", http.StatusForbidden)
+		}
+`
+	}
+
+	result += fmt.Sprintf("\n		params, err := paramsParse%v(r)", method.ParamName)
+	result += fmt.Sprintf("\n		if err != nil {\n			http.Error(w, err.Error(), http.StatusBadRequest)\n		}\n")
+
+	result += "\n		err = params.Validate()"
+	result += fmt.Sprintf("\n		if err != nil {\n			http.Error(w, err.Error(), http.StatusBadRequest)\n		}\n")
+	return result
+}
+
+func toSnakeCase(str string) string {
+	snake := matchFirstCap.ReplaceAllString(str, "${1}_${2}")
+	snake = matchAllCap.ReplaceAllString(snake, "${1}_${2}")
+	return strings.ToLower(snake)
 }
