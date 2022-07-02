@@ -15,37 +15,56 @@ import (
 )
 
 const (
+	parseFuncCode = `
+func paramsParse%v(r *http.Request) (res *%v, err error) {
+	res = &%v{}
+%v
+
+	return res, err
+}
+
+`
+
+	parseIntParamCode = `
+res.%v, err = strconv.Atoi(r.FormValue("%v"))
+if err != nil {
+	return nil, errors.New("%v must be int")
+}`
+
+	parseStringParamCode = `
+res.%v = r.FormValue("%v")`
+
 	requiredCode = `
-	if s.%v == %v {
-		return errors.New("%v must be not empty")
-	}
+if s.%v == %v {
+	return errors.New("%v must be not empty")
+}`
 
-`
+	validateFuncCode = `
+func (s *%v) Validate() (err error) {
+%v
+
+	return err
+}`
+
+	enumCheckCode = `
+if %v {
+	return errors.New("%v must be one of [%v]")
+}`
+
 	minIntCode = `
-	if s.%v < %v {
-		return errors.New("%v must be >= %v")
-	}
-
-`
+if s.%v < %v {
+	return errors.New("%v must be >= %v")
+}`
 
 	minStrCode = `
-	if len(s.%v) < %v {
-		return errors.New("%v len must be >= %v")
-	}
-
-`
+if len(s.%v) < %v {
+	return errors.New("%v len must be >= %v")
+}`
 
 	maxIntCode = `
-	if s.%v > %v {
-		return errors.New("%v must be <= %v")
-	}
-
-`
-	checkStringIsIntCode = `
-	if _, err := strconv.Atoi(%v.%v); err != nil {
-		return false
-	}
-`
+if s.%v > %v {
+	return errors.New("%v must be <= %v")
+}`
 )
 
 var matchFirstCap = regexp.MustCompile("(.)([A-Z][a-z]+)")
@@ -77,7 +96,8 @@ func main() {
 
 	imports := map[string]interface{}{}
 	imports["net/http"] = true
-	paramsBody := ""
+	var parseFuncs []string
+	var validateFuncs []string
 	// [type]->[url]->[method]->has_auth
 	apiMethodDecls := make(map[string]map[string]map[string]MethodDefinition)
 SPECS_LOOP:
@@ -146,131 +166,11 @@ SPECS_LOOP:
 				}
 
 				structName := currType.Name.Name
-				parseTemplate := fmt.Sprintf("func paramsParse%v(r *http.Request) (*%v, error) {\n", structName, structName)
-				parseTemplate += fmt.Sprintf("	resStruct := &%v{}\n", structName)
-				validateTemplate := fmt.Sprintf("func (s *%v) Validate() error {\n", structName)
-				isParamsStruct := false
-			FIELDS_LOOP:
-				for _, field := range currStruct.Fields.List {
-					if field.Tag != nil {
-						tag := reflect.StructTag(field.Tag.Value[1 : len(field.Tag.Value)-1])
-						apiValidateStr := tag.Get("apivalidator")
-						if apiValidateStr == "" {
-							continue FIELDS_LOOP
-						}
-						isParamsStruct = true
-
-						apiValidateOpts := strings.Split(apiValidateStr, ",")
-						hasErrParse := false
-
-						fieldType := field.Type.(*ast.Ident).Name
-						if fieldType != "int" && fieldType != "string" {
-							log.Fatalln("unsupported", fieldType)
-						}
-
-						paramName := toSnakeCase(field.Names[0].Name)
-						if fieldType == "int" {
-							if !hasErrParse {
-								parseTemplate += fmt.Sprintf("\n	var err error\n")
-							}
-							parseTemplate += fmt.Sprintf(
-								"	resStruct.%v, err = strconv.Atoi(r.FormValue(\"%v\"))\n",
-								field.Names[0].Name, paramName,
-							)
-							parseTemplate += fmt.Sprintf(`	if err != nil {
-		return nil, errors.New("%v must be int")
-	}
-`, paramName)
-							imports["strconv"] = true
-							imports["errors"] = true
-							hasErrParse = true
-						} else {
-
-							parseTemplate += fmt.Sprintf(
-								"	resStruct.%v = r.FormValue(\"%v\")\n",
-								field.Names[0].Name, paramName,
-							)
-						}
-
-					OPTS_LOOP:
-						for _, opt := range apiValidateOpts {
-
-							if opt == "required" {
-								imports["errors"] = true
-								if fieldType == "int" {
-									validateTemplate += fmt.Sprintf(requiredCode, field.Names[0].Name, 0, paramName)
-								} else {
-									validateTemplate += fmt.Sprintf(requiredCode, field.Names[0].Name, `""`, paramName)
-								}
-								continue OPTS_LOOP
-							}
-
-							parsedOpt := strings.Split(opt, "=")
-							if len(parsedOpt) != 2 {
-								log.Fatalln("need pair field", fieldType)
-							}
-
-							if parsedOpt[0] == "enum" {
-								imports["errors"] = true
-								enumList := strings.Split(parsedOpt[1], "|")
-								conditionList := []string{}
-								if fieldType == "int" {
-									condition := fmt.Sprintf("s.%v != %v", field.Names[0].Name, 0)
-									conditionList = append(conditionList, condition)
-									for enumItem := range enumList {
-										condition := fmt.Sprintf("s.%v != %v", field.Names[0].Name, enumItem)
-										conditionList = append(conditionList, condition)
-									}
-								} else {
-									condition := fmt.Sprintf("s.%v != \"%v\"", field.Names[0].Name, "")
-									conditionList = append(conditionList, condition)
-									for _, enumItem := range enumList {
-										condition := fmt.Sprintf("s.%v != \"%v\"", field.Names[0].Name, enumItem)
-										conditionList = append(conditionList, condition)
-									}
-								}
-								validateTemplate += fmt.Sprintf("	if %v {\n", strings.Join(conditionList, " && "))
-								validateTemplate += fmt.Sprintf("		return errors.New(\"%v must be one of [%v]\")\n	}\n\n", paramName, strings.Join(enumList, ", "))
-								continue OPTS_LOOP
-							}
-
-							if parsedOpt[0] == "min" {
-								if _, err := strconv.Atoi(parsedOpt[1]); err != nil {
-									log.Fatalln("min should be integer")
-								}
-
-								imports["errors"] = true
-								if fieldType == "int" {
-									validateTemplate += fmt.Sprintf(minIntCode, field.Names[0].Name, parsedOpt[1], paramName, parsedOpt[1])
-								} else {
-									validateTemplate += fmt.Sprintf(minStrCode, field.Names[0].Name, parsedOpt[1], paramName, parsedOpt[1])
-								}
-								continue OPTS_LOOP
-							}
-
-							if parsedOpt[0] == "max" {
-								if _, err := strconv.Atoi(parsedOpt[1]); err != nil {
-									log.Fatalln("max should be integer")
-								}
-
-								if fieldType == "int" {
-									validateTemplate += fmt.Sprintf(maxIntCode, field.Names[0].Name, parsedOpt[1], paramName, parsedOpt[1])
-								} else {
-									log.Fatalln("max validator only for int params")
-								}
-								continue OPTS_LOOP
-							}
-						}
-					}
+				if parseFunc := getParseFunc(structName, currStruct, imports); parseFunc != "" {
+					parseFuncs = append(parseFuncs, parseFunc)
 				}
-
-				if isParamsStruct {
-					parseTemplate += "	return resStruct, nil\n"
-					parseTemplate += "}\n\n"
-					paramsBody += parseTemplate
-					validateTemplate += "	return nil\n"
-					validateTemplate += "}\n\n"
-					paramsBody += validateTemplate
+				if validateFunc := getValidateFunc(structName, currStruct, imports); validateFunc != "" {
+					validateFuncs = append(validateFuncs, validateFunc)
 				}
 			}
 		default:
@@ -287,8 +187,9 @@ SPECS_LOOP:
 		fmt.Fprint(out, ")\n\n")
 	}
 
-	fmt.Fprint(out, paramsBody)
-	fmt.Fprint(out, parseApiDecls(&apiMethodDecls))
+	fmt.Fprintln(out, strings.Join(parseFuncs, "\n"))
+	fmt.Fprintln(out, strings.Join(validateFuncs, "\n"))
+	fmt.Fprintln(out, parseApiDecls(&apiMethodDecls))
 }
 
 func parseApiDecls(apiMethodDecls *map[string]map[string]map[string]MethodDefinition) string {
@@ -390,8 +291,206 @@ func parseMethod(method MethodDefinition) string {
 	return result
 }
 
+func getParseFunc(structName string, paramsType *ast.StructType, imports map[string]interface{}) string {
+	var paramsSetTemplates []string
+
+	isParamsStruct := false
+FIELDS_LOOP:
+	for _, field := range paramsType.Fields.List {
+		if field.Tag != nil {
+			tag := reflect.StructTag(field.Tag.Value[1 : len(field.Tag.Value)-1])
+			apiValidateStr := tag.Get("apivalidator")
+			if apiValidateStr == "" {
+				continue FIELDS_LOOP
+			}
+			isParamsStruct = true
+
+			apiValidateOpts := strings.Split(apiValidateStr, ",")
+
+			fieldType := field.Type.(*ast.Ident).Name
+			if fieldType != "int" && fieldType != "string" {
+				log.Fatalln("unsupported", fieldType)
+			}
+
+			var paramName string
+			for _, opt := range apiValidateOpts {
+
+				parsedOpt := strings.Split(opt, "=")
+				if len(parsedOpt) == 1 {
+					continue
+				}
+				if len(parsedOpt) != 2 {
+					log.Fatalln("need pair field", fieldType)
+				}
+
+				if parsedOpt[0] == "paramname" {
+					paramName = parsedOpt[1]
+				}
+			}
+			if paramName == "" {
+				paramName = toSnakeCase(field.Names[0].Name)
+			}
+
+			if fieldType == "int" {
+				imports["strconv"] = true
+				imports["errors"] = true
+				paramsSetTemplates = append(paramsSetTemplates, fmt.Sprintf(parseIntParamCode, field.Names[0].Name, paramName, paramName))
+			} else {
+				paramsSetTemplates = append(paramsSetTemplates, fmt.Sprintf(parseStringParamCode, field.Names[0].Name, paramName))
+			}
+		}
+	}
+
+	if !isParamsStruct {
+		return ""
+	}
+
+	funcBody := strings.Join(paramsSetTemplates, "")
+	return fmt.Sprintf(parseFuncCode, structName, structName, structName, addSpace(funcBody, 1))
+}
+
+func getValidateFunc(structName string, paramsType *ast.StructType, imports map[string]interface{}) string {
+	var validateParamsTemplates []string
+
+	isParamsStruct := false
+FIELDS_LOOP:
+	for _, field := range paramsType.Fields.List {
+		if field.Tag != nil {
+			tag := reflect.StructTag(field.Tag.Value[1 : len(field.Tag.Value)-1])
+			apiValidateStr := tag.Get("apivalidator")
+			if apiValidateStr == "" {
+				continue FIELDS_LOOP
+			}
+			isParamsStruct = true
+
+			apiValidateOpts := strings.Split(apiValidateStr, ",")
+
+			fieldType := field.Type.(*ast.Ident).Name
+			if fieldType != "int" && fieldType != "string" {
+				log.Fatalln("unsupported", fieldType)
+			}
+
+			var paramName string
+			for _, opt := range apiValidateOpts {
+
+				parsedOpt := strings.Split(opt, "=")
+				if len(parsedOpt) == 1 {
+					continue
+				}
+				if len(parsedOpt) != 2 {
+					log.Fatalln("need pair field", fieldType)
+				}
+
+				if parsedOpt[0] == "paramname" {
+					paramName = parsedOpt[1]
+				}
+			}
+			if paramName == "" {
+				paramName = toSnakeCase(field.Names[0].Name)
+			}
+
+		OPTS_LOOP:
+			for _, opt := range apiValidateOpts {
+
+				parsedOpt := strings.Split(opt, "=")
+				if parsedOpt[0] == "required" {
+					imports["errors"] = true
+					if fieldType == "int" {
+						validateParamsTemplates = append(validateParamsTemplates, fmt.Sprintf(requiredCode, field.Names[0].Name, 0, paramName))
+					} else {
+						validateParamsTemplates = append(validateParamsTemplates, fmt.Sprintf(requiredCode, field.Names[0].Name, `""`, paramName))
+					}
+					continue OPTS_LOOP
+				}
+
+				if len(parsedOpt) != 2 {
+					log.Fatalln("need pair field", field.Names[0].Name)
+				}
+
+				if parsedOpt[0] == "enum" {
+					imports["errors"] = true
+					enumList := strings.Split(parsedOpt[1], "|")
+					validateParamsTemplates = append(validateParamsTemplates, getEnumCheck(enumList, field.Names[0].Name, paramName, fieldType))
+					continue OPTS_LOOP
+				}
+
+				if parsedOpt[0] == "min" {
+					if _, err := strconv.Atoi(parsedOpt[1]); err != nil {
+						log.Fatalln("min should be integer")
+					}
+
+					imports["errors"] = true
+					if fieldType == "int" {
+						validateParamsTemplates = append(validateParamsTemplates, fmt.Sprintf(minIntCode, field.Names[0].Name, parsedOpt[1], paramName, parsedOpt[1]))
+					} else {
+						validateParamsTemplates = append(validateParamsTemplates, fmt.Sprintf(minStrCode, field.Names[0].Name, parsedOpt[1], paramName, parsedOpt[1]))
+					}
+					continue OPTS_LOOP
+				}
+
+				if parsedOpt[0] == "max" {
+					if _, err := strconv.Atoi(parsedOpt[1]); err != nil {
+						log.Fatalln("max should be integer")
+					}
+
+					if fieldType == "int" {
+						validateParamsTemplates = append(validateParamsTemplates, fmt.Sprintf(maxIntCode, field.Names[0].Name, parsedOpt[1], paramName, parsedOpt[1]))
+					} else {
+						log.Fatalln("max validator only for int params")
+					}
+					continue OPTS_LOOP
+				}
+
+			}
+		}
+	}
+
+	if !isParamsStruct {
+		return ""
+	}
+
+	funcBody := strings.Join(validateParamsTemplates, "")
+	return fmt.Sprintf(validateFuncCode, structName, addSpace(funcBody, 1))
+}
+
+func getEnumCheck(enumList []string, fieldName string, paramName string, fieldType string) string {
+	conditionList := []string{}
+	if fieldType == "int" {
+		condition := fmt.Sprintf("s.%v != %v", fieldName, 0)
+		conditionList = append(conditionList, condition)
+		for enumItem := range enumList {
+			condition := fmt.Sprintf("s.%v != %v", fieldName, enumItem)
+			conditionList = append(conditionList, condition)
+		}
+	} else if fieldType == "string" {
+		condition := fmt.Sprintf("s.%v != \"%v\"", fieldName, "")
+		conditionList = append(conditionList, condition)
+		for _, enumItem := range enumList {
+			condition := fmt.Sprintf("s.%v != \"%v\"", fieldName, enumItem)
+			conditionList = append(conditionList, condition)
+		}
+	} else {
+		log.Fatal("Only int and string types supported")
+	}
+
+	condStr := strings.Join(conditionList, " && ")
+
+	return fmt.Sprintf(enumCheckCode, condStr, paramName, strings.Join(enumList, ", "))
+}
+
 func toSnakeCase(str string) string {
 	snake := matchFirstCap.ReplaceAllString(str, "${1}_${2}")
 	snake = matchAllCap.ReplaceAllString(snake, "${1}_${2}")
 	return strings.ToLower(snake)
+}
+
+func addSpace(code string, num int) string {
+	space := strings.Repeat("\t", num)
+	codeStrings := strings.Split(code, "\n")
+	for i := range codeStrings {
+		if len(codeStrings[i]) != 0 {
+			codeStrings[i] = space + codeStrings[i]
+		}
+	}
+	return strings.Join(codeStrings, "\n")
 }
