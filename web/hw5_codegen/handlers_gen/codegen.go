@@ -17,7 +17,7 @@ import (
 const (
 	requiredCode = `
 	if s.%v == %v {
-		return errors.New("%v must be a empty")
+		return errors.New("%v must be not empty")
 	}
 
 `
@@ -37,7 +37,7 @@ const (
 
 	maxIntCode = `
 	if s.%v > %v {
-		return errors.New("%v must be >= %v")
+		return errors.New("%v must be <= %v")
 	}
 
 `
@@ -127,8 +127,8 @@ SPECS_LOOP:
 				apiMethodDecls[receiverTypeName][apiDefinition.Url] = make(map[string]MethodDefinition)
 			}
 			apiMethodDecls[receiverTypeName][apiDefinition.Url][apiDefinition.Method] = MethodDefinition{apiDefinition.Auth, paramName, funcNode.Name.Name}
-
-			imports["context"] = true
+			imports["fmt"] = true
+			imports["encoding/json"] = true
 
 		case *ast.GenDecl:
 			genNode := topDecl.(*ast.GenDecl)
@@ -162,35 +162,38 @@ SPECS_LOOP:
 
 						apiValidateOpts := strings.Split(apiValidateStr, ",")
 						hasErrParse := false
-						for _, opt := range apiValidateOpts {
-							fieldType := field.Type.(*ast.Ident).Name
-							if fieldType != "int" && fieldType != "string" {
-								log.Fatalln("unsupported", fieldType)
-							}
 
-							paramName := toSnakeCase(field.Names[0].Name)
-							if fieldType == "int" {
-								if !hasErrParse {
-									parseTemplate += fmt.Sprintf("\n	var err error\n")
-								}
-								parseTemplate += fmt.Sprintf(
-									"	resStruct.%v, err = strconv.Atoi(r.FormValue(\"%v\"))\n",
-									field.Names[0].Name, paramName,
-								)
-								parseTemplate += fmt.Sprintf(`	if err != nil {
+						fieldType := field.Type.(*ast.Ident).Name
+						if fieldType != "int" && fieldType != "string" {
+							log.Fatalln("unsupported", fieldType)
+						}
+
+						paramName := toSnakeCase(field.Names[0].Name)
+						if fieldType == "int" {
+							if !hasErrParse {
+								parseTemplate += fmt.Sprintf("\n	var err error\n")
+							}
+							parseTemplate += fmt.Sprintf(
+								"	resStruct.%v, err = strconv.Atoi(r.FormValue(\"%v\"))\n",
+								field.Names[0].Name, paramName,
+							)
+							parseTemplate += fmt.Sprintf(`	if err != nil {
 		return nil, errors.New("%v must be int")
 	}
 `, paramName)
-								imports["strconv"] = true
-								imports["errors"] = true
-								hasErrParse = true
-							} else {
+							imports["strconv"] = true
+							imports["errors"] = true
+							hasErrParse = true
+						} else {
 
-								parseTemplate += fmt.Sprintf(
-									"	resStruct.%v = r.FormValue(\"%v\")\n",
-									field.Names[0].Name, paramName,
-								)
-							}
+							parseTemplate += fmt.Sprintf(
+								"	resStruct.%v = r.FormValue(\"%v\")\n",
+								field.Names[0].Name, paramName,
+							)
+						}
+
+					OPTS_LOOP:
+						for _, opt := range apiValidateOpts {
 
 							if opt == "required" {
 								imports["errors"] = true
@@ -199,7 +202,7 @@ SPECS_LOOP:
 								} else {
 									validateTemplate += fmt.Sprintf(requiredCode, field.Names[0].Name, `""`, paramName)
 								}
-								continue FIELDS_LOOP
+								continue OPTS_LOOP
 							}
 
 							parsedOpt := strings.Split(opt, "=")
@@ -212,11 +215,15 @@ SPECS_LOOP:
 								enumList := strings.Split(parsedOpt[1], "|")
 								conditionList := []string{}
 								if fieldType == "int" {
+									condition := fmt.Sprintf("s.%v != %v", field.Names[0].Name, 0)
+									conditionList = append(conditionList, condition)
 									for enumItem := range enumList {
 										condition := fmt.Sprintf("s.%v != %v", field.Names[0].Name, enumItem)
 										conditionList = append(conditionList, condition)
 									}
 								} else {
+									condition := fmt.Sprintf("s.%v != \"%v\"", field.Names[0].Name, "")
+									conditionList = append(conditionList, condition)
 									for _, enumItem := range enumList {
 										condition := fmt.Sprintf("s.%v != \"%v\"", field.Names[0].Name, enumItem)
 										conditionList = append(conditionList, condition)
@@ -224,7 +231,7 @@ SPECS_LOOP:
 								}
 								validateTemplate += fmt.Sprintf("	if %v {\n", strings.Join(conditionList, " && "))
 								validateTemplate += fmt.Sprintf("		return errors.New(\"%v must be one of [%v]\")\n	}\n\n", paramName, strings.Join(enumList, ", "))
-								continue FIELDS_LOOP
+								continue OPTS_LOOP
 							}
 
 							if parsedOpt[0] == "min" {
@@ -238,7 +245,7 @@ SPECS_LOOP:
 								} else {
 									validateTemplate += fmt.Sprintf(minStrCode, field.Names[0].Name, parsedOpt[1], paramName, parsedOpt[1])
 								}
-								continue FIELDS_LOOP
+								continue OPTS_LOOP
 							}
 
 							if parsedOpt[0] == "max" {
@@ -251,7 +258,7 @@ SPECS_LOOP:
 								} else {
 									log.Fatalln("max validator only for int params")
 								}
-								continue FIELDS_LOOP
+								continue OPTS_LOOP
 							}
 						}
 					}
@@ -300,7 +307,7 @@ func parseApiDecls(apiMethodDecls *map[string]map[string]map[string]MethodDefini
 		}
 		result += `
 	default:
-		http.Error(w, "unknown method", http.StatusNotFound)
+		http.Error(w, "{\"error\": \"unknown method\"}", http.StatusNotFound)
 	}
 
 }
@@ -319,11 +326,12 @@ func parseMethodsDecls(methodDecls *map[string]MethodDefinition) string {
 		if method != "" {
 			result += fmt.Sprintf(`
 		if r.Method != %#v {
-			http.Error(w, "bad method", http.StatusNotAcceptable)
+			http.Error(w, "{\"error\": \"bad method\"}", http.StatusNotAcceptable)
+			return
 		}
 `, method)
-			result += parseMethod((*methodDecls)[method])
 		}
+		result += parseMethod((*methodDecls)[method])
 	} else {
 		result += fmt.Sprintf(`
 		switch r.Method {
@@ -354,16 +362,31 @@ func parseMethod(method MethodDefinition) string {
 	if method.Auth {
 		result += `
 		if r.Header.Get("X-Auth") != "100500" {
-			http.Error(w, "unauthorized", http.StatusForbidden)
+			http.Error(w, "{\"error\": \"unauthorized\"}", http.StatusForbidden)
+			return
 		}
 `
 	}
 
 	result += fmt.Sprintf("\n		params, err := paramsParse%v(r)", method.ParamName)
-	result += fmt.Sprintf("\n		if err != nil {\n			http.Error(w, err.Error(), http.StatusBadRequest)\n		}\n")
+	result += fmt.Sprint("\n		var errResp []byte")
+	result += fmt.Sprint("\n		if err != nil {\n			errResp, _ = json.Marshal(map[string]interface{}{\"error\": err.Error()})\n			http.Error(w, string(errResp), http.StatusBadRequest)\n			return\n		}\n")
 
 	result += "\n		err = params.Validate()"
-	result += fmt.Sprintf("\n		if err != nil {\n			http.Error(w, err.Error(), http.StatusBadRequest)\n		}\n")
+	result += fmt.Sprintf("\n		if err != nil {\n			errResp, _ = json.Marshal(map[string]interface{}{\"error\": err.Error()})\n			http.Error(w, string(errResp), http.StatusBadRequest)\n			return\n		}\n")
+
+	result += fmt.Sprintf("\n		fRes, err := h.%v(r.Context(), *params)\n", method.FuncName)
+	result += fmt.Sprint("\n		if err != nil {")
+	result += fmt.Sprint("\n			errApi, ok := err.(ApiError)")
+	result += fmt.Sprint("\n			if(ok) {\n				errResp, _ = json.Marshal(map[string]interface{}{\"error\": errApi.Err.Error()})\n				http.Error(w, string(errResp), errApi.HTTPStatus)\n				return\n			} else {")
+	result += fmt.Sprint("\n				errResp, _ = json.Marshal(map[string]interface{}{\"error\": err.Error()})\n				http.Error(w, string(errResp), http.StatusInternalServerError)\n				return\n			}\n")
+	result += fmt.Sprint("\n		}")
+	result += fmt.Sprint("\n		result := map[string]interface{}{\"response\": fRes, \"error\": \"\"}")
+	result += fmt.Sprint("\n		resultMarhalled, err := json.Marshal(result)")
+	result += fmt.Sprint("\n		if err != nil {\n			http.Error(w, \"{\\\"error\\\":\\\"\\\"}\", http.StatusInternalServerError)\n			return\n		}\n")
+
+	result += fmt.Sprint("\n		fmt.Fprintln(w, string(resultMarhalled))")
+
 	return result
 }
 
