@@ -51,6 +51,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			h.getRecordItem(w, r, tableName, recordId)
 			return
+		} else if r.Method == http.MethodPost {
+			h.updateRecord(w, r, tableName, recordId)
+			return
 		} else {
 			result, _ := json.Marshal(map[string]string{"error": "method not supported"})
 			http.Error(w, string(result), http.StatusMethodNotAllowed)
@@ -120,7 +123,7 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	} else {
 		limit, err = strconv.Atoi(limitStr)
 		if err != nil {
-			result, _ := json.Marshal(map[string]string{"error": "field limit has invalid type"})
+			result, _ := json.Marshal(map[string]string{"error": "field limit have invalid type"})
 			http.Error(w, string(result), http.StatusBadRequest)
 			return
 		}
@@ -133,7 +136,7 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	} else {
 		offset, err = strconv.Atoi(offsetStr)
 		if err != nil {
-			result, _ := json.Marshal(map[string]string{"error": "field limit has invalid type"})
+			result, _ := json.Marshal(map[string]string{"error": "field offset have invalid type"})
 			http.Error(w, string(result), http.StatusBadRequest)
 			return
 		}
@@ -227,7 +230,13 @@ func (h *Handler) addRecord(w http.ResponseWriter, r *http.Request, tableName st
 
 	table := (*h.Tables)[tableIndex]
 
-	r.ParseForm()
+	var reqBody map[string]interface{}
+	err := json.NewDecoder(r.Body).Decode(&reqBody)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	var fieldNames []string
 	var paramsTemplates []string
 	var values []interface{}
@@ -236,18 +245,25 @@ func (h *Handler) addRecord(w http.ResponseWriter, r *http.Request, tableName st
 			continue
 		}
 
-		if r.PostForm.Has(field.Field) {
-			fieldNames = append(fieldNames, field.Field)
-			value := r.FormValue(field.Field)
-			valueParsed, ok := validate(value, field)
-			if !ok {
-				result, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("field %v has invalid type", field.Field)})
+		value, ok := reqBody[field.Field]
+		if ok {
+			valueStr, ok := value.(string)
+			valueParsed, okValidate := validate(valueStr, field)
+			if !(ok && okValidate) {
+				result, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("field %v have invalid type", field.Field)})
 				http.Error(w, string(result), http.StatusBadRequest)
 				return
 			}
 
 			values = append(values, valueParsed)
+			fieldNames = append(fieldNames, field.Field)
 			paramsTemplates = append(paramsTemplates, "?")
+		} else {
+			if field.Default == "NULL" && field.Null == "NO" {
+				result, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("field %v have invalid type", field.Field)})
+				http.Error(w, string(result), http.StatusBadRequest)
+				return
+			}
 		}
 	}
 
@@ -270,7 +286,98 @@ func (h *Handler) addRecord(w http.ResponseWriter, r *http.Request, tableName st
 		return
 	}
 
-	response := map[string]interface{}{"response": map[string]interface{}{"record": lastId}}
+	response := map[string]interface{}{"response": map[string]interface{}{table.PrimaryField: lastId}}
+	err = json.NewEncoder(w).Encode(response)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request, tableName string, recordId int) {
+	tableIndex, ok := (*h.TablesHash)[tableName]
+	if !ok {
+		result, _ := json.Marshal(map[string]string{"error": "unknown table"})
+		http.Error(w, string(result), http.StatusNotFound)
+		return
+	}
+
+	table := (*h.Tables)[tableIndex]
+
+	var reqBody map[string]interface{}
+	err := json.NewDecoder(r.Body).Decode(&reqBody)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var fieldsTemplates []string
+	var params []interface{}
+	for _, field := range table.Fields {
+		value, ok := reqBody[field.Field]
+
+		if field.Field == table.PrimaryField {
+			if ok {
+				result, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("field %v have invalid type", field.Field)})
+				http.Error(w, string(result), http.StatusBadRequest)
+				return
+			} else {
+				continue
+			}
+		}
+
+		if ok {
+			fieldsTemplates = append(fieldsTemplates, fmt.Sprintf("%v=?", field.Field))
+			if value != nil {
+				valueStr, ok := value.(string)
+				valueParsed, okValidate := validate(valueStr, field)
+				if !(ok && okValidate) {
+					result, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("field %v have invalid type", field.Field)})
+					http.Error(w, string(result), http.StatusBadRequest)
+					return
+				}
+
+				params = append(params, valueParsed)
+			} else {
+				if field.Null == "NO" {
+					result, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("field %v have invalid type", field.Field)})
+					http.Error(w, string(result), http.StatusBadRequest)
+					return
+				}
+
+				params = append(params, nil)
+			}
+		}
+	}
+
+	if len(params) == 0 {
+		result, _ := json.Marshal(map[string]string{"error": "nothing to edit"})
+		http.Error(w, string(result), http.StatusBadRequest)
+		return
+	}
+
+	params = append(params, recordId)
+
+	query := fmt.Sprintf(
+		"UPDATE %v SET %v WHERE %v=?",
+		tableName,
+		strings.Join(fieldsTemplates, ","),
+		table.PrimaryField,
+	)
+
+	result, err := h.DB.Exec(query, params...)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := map[string]interface{}{"response": map[string]interface{}{"updated": affected}}
 	err = json.NewEncoder(w).Encode(response)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -351,6 +458,16 @@ func validate(value string, field TableField) (valueParsed interface{}, ok bool)
 		}
 		return valueParsed, true
 	} else if field.Type == "string" {
+		_, err := strconv.Atoi(value)
+		if err == nil {
+			return nil, false
+		}
+
+		_, err = strconv.ParseFloat(value, 64)
+		if err == nil {
+			return nil, false
+		}
+
 		return value, true
 	} else if field.Type == "float" {
 		valueParsed, err := strconv.ParseFloat(value, 64)
@@ -358,7 +475,7 @@ func validate(value string, field TableField) (valueParsed interface{}, ok bool)
 			return nil, false
 		}
 		return valueParsed, true
-	} else if field.Type == "bool" {
+	} else if field.Type == "boolean" {
 		valueParsed, err := strconv.ParseBool(value)
 		if err != nil {
 			return nil, false
