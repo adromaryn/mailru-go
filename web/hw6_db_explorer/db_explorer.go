@@ -51,7 +51,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.getRecord(w, r, tableName, recordId)
 			return
 		} else {
-			http.Error(w, "Method not supported", http.StatusMethodNotAllowed)
+			result, _ := json.Marshal(map[string]string{"error": "method not supported"})
+			http.Error(w, string(result), http.StatusMethodNotAllowed)
 			return
 		}
 	}
@@ -63,7 +64,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.getTableRecordsList(w, r, tableName)
 			return
 		} else {
-			http.Error(w, "Method not supported", http.StatusMethodNotAllowed)
+			result, _ := json.Marshal(map[string]string{"error": "method not supported"})
+			http.Error(w, string(result), http.StatusMethodNotAllowed)
 			return
 		}
 	}
@@ -72,7 +74,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.getTablesList(w, r)
 		return
 	} else {
-		http.Error(w, "Method not supported", http.StatusMethodNotAllowed)
+		result, _ := json.Marshal(map[string]string{"error": "method not supported"})
+		http.Error(w, string(result), http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -113,7 +116,9 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	} else {
 		limit, err = strconv.Atoi(limitStr)
 		if err != nil {
-			http.Error(w, "Invalid parameter `limit`", http.StatusBadRequest)
+			result, _ := json.Marshal(map[string]string{"error": "field limit has invalid type"})
+			http.Error(w, string(result), http.StatusBadRequest)
+			return
 		}
 	}
 
@@ -124,7 +129,9 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	} else {
 		offset, err = strconv.Atoi(offsetStr)
 		if err != nil {
-			http.Error(w, "Invalid parameter `offset`", http.StatusBadRequest)
+			result, _ := json.Marshal(map[string]string{"error": "field limit has invalid type"})
+			http.Error(w, string(result), http.StatusBadRequest)
+			return
 		}
 	}
 
