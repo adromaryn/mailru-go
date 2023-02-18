@@ -21,15 +21,15 @@ type TableField struct {
 }
 
 type Table struct {
-	Table string
+	Table  string
 	Fields []TableField
 }
 
 type Handler struct {
-	DB     *sql.DB
-	Tables *[]Table
-	TablesHash *map[string]int
-	RecordItemPathRegexp *regexp.Regexp
+	DB                    *sql.DB
+	Tables                *[]Table
+	TablesHash            *map[string]int
+	RecordItemPathRegexp  *regexp.Regexp
 	RecordsListPathRegexp *regexp.Regexp
 }
 
@@ -38,7 +38,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	parsedPath := h.RecordItemPathRegexp.FindSubmatch([]byte(path))
 	if len(parsedPath) == 3 {
-		panic("AAA")
+		tableName := string(parsedPath[1])
+		recordIdStr := string(parsedPath[2])
+		recordId, err := strconv.Atoi(recordIdStr)
+		if err != nil {
+			result, _ := json.Marshal(map[string]string{"error": "field id have invalid type"})
+			http.Error(w, string(result), http.StatusBadRequest)
+			return
+		}
+
+		if r.Method == http.MethodGet {
+			h.getRecord(w, r, tableName, recordId)
+			return
+		} else {
+			http.Error(w, "Method not supported", http.StatusMethodNotAllowed)
+			return
+		}
 	}
 
 	parsedPath = h.RecordsListPathRegexp.FindSubmatch([]byte(path))
@@ -61,7 +76,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	
 }
 
 func (h *Handler) getTablesList(w http.ResponseWriter, r *http.Request) {
@@ -84,10 +98,7 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 
 	tableIndex, ok := (*h.TablesHash)[tableName]
 	if !ok {
-		result, err := json.Marshal(map[string]string{"error": "unknown table"})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		result, _ := json.Marshal(map[string]string{"error": "unknown table"})
 		http.Error(w, string(result), http.StatusNotFound)
 		return
 	}
@@ -118,12 +129,12 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	}
 
 	var fieldNames []string
-	for _, field  := range table.Fields {
+	for _, field := range table.Fields {
 		fieldNames = append(fieldNames, field.Field)
 	}
 
 	query := fmt.Sprintf("SELECT %v FROM %v LIMIT ? OFFSET ?", strings.Join(fieldNames, ", "), tableName)
-	rows, err :=  h.DB.Query(query, limit, offset)
+	rows, err := h.DB.Query(query, limit, offset)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -151,6 +162,47 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	}
 }
 
+func (h *Handler) getRecord(w http.ResponseWriter, r *http.Request, tableName string, recordId int) {
+	tableIndex, ok := (*h.TablesHash)[tableName]
+	if !ok {
+		result, _ := json.Marshal(map[string]string{"error": "unknown table"})
+		http.Error(w, string(result), http.StatusNotFound)
+		return
+	}
+
+	table := (*h.Tables)[tableIndex]
+
+	var fieldNames []string
+	for _, field := range table.Fields {
+		fieldNames = append(fieldNames, field.Field)
+	}
+
+	query := fmt.Sprintf("SELECT %v FROM %v WHERE id = ?", strings.Join(fieldNames, ", "), tableName)
+	row := h.DB.QueryRow(query, recordId)
+
+	result := make(map[string]interface{}, 0)
+	record := h.prepareValuesSlice(tableName)
+	row.Scan(record...)
+
+	for index, fieldName := range fieldNames {
+		reflectValue := h.getValueFromInterface(tableName, record[index], index)
+		result[fieldName] = reflectValue
+	}
+
+	if result["id"] == nil {
+		result, _ := json.Marshal(map[string]string{"error": "record not found"})
+		http.Error(w, string(result), http.StatusNotFound)
+		return
+	}
+
+	response := map[string]interface{}{"response": map[string]interface{}{"record": result}}
+	err := json.NewEncoder(w).Encode(response)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
 func (h *Handler) prepareValuesSlice(tableName string) []interface{} {
 	tableIndex, ok := (*h.TablesHash)[tableName]
 	if !ok {
@@ -158,7 +210,7 @@ func (h *Handler) prepareValuesSlice(tableName string) []interface{} {
 	}
 	table := (*h.Tables)[tableIndex]
 
-	values := make([]interface{},len(table.Fields))
+	values := make([]interface{}, len(table.Fields))
 
 	for idx, field := range table.Fields {
 		if field.Type == "int" {
@@ -239,13 +291,12 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 			panic(err)
 		}
 
-
 		table.Fields = fillFieldsDataSlice(rows, table.Table)
 		tables[index] = table
 		tablesHash[table.Table] = index
 	}
 
-	recordItemPathRegexp, _ := regexp.Compile(`^\/([A-Za-z1-9\_]+)\/(\d+)\/?$`)
+	recordItemPathRegexp, _ := regexp.Compile(`^\/([A-Za-z1-9\_]+)\/([^\/]+)\/?$`)
 	recordsListPathRegexp, _ := regexp.Compile(`^\/([A-Za-z1-9\_]+)\/?$`)
 
 	siteMux := http.NewServeMux()
@@ -256,7 +307,7 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 	return siteMux, nil
 }
 
-func fillFieldsDataSlice (rows *sql.Rows, table string) []TableField {
+func fillFieldsDataSlice(rows *sql.Rows, table string) []TableField {
 	defer rows.Close()
 
 	var fields []TableField
