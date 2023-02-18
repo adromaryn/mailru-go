@@ -20,9 +20,15 @@ type TableField struct {
 	Extra   string
 }
 
+type Table struct {
+	Table string
+	Fields []TableField
+}
+
 type Handler struct {
 	DB     *sql.DB
-	Tables *map[string][]TableField
+	Tables *[]Table
+	TablesHash *map[string]int
 	RecordItemPathRegexp *regexp.Regexp
 	RecordsListPathRegexp *regexp.Regexp
 }
@@ -60,8 +66,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) getTablesList(w http.ResponseWriter, r *http.Request) {
 	var tables []string
-	for table := range *h.Tables {
-		tables = append(tables, table)
+	for _, table := range *h.Tables {
+		tables = append(tables, table.Table)
 	}
 
 	response := map[string]interface{}{"response": map[string]interface{}{"tables": tables}}
@@ -76,12 +82,17 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	const LIMIT = 5
 	const OFFSET = 0
 
-	table, ok := (*h.Tables)[tableName]
+	tableIndex, ok := (*h.TablesHash)[tableName]
 	if !ok {
-		errStr := fmt.Sprintf("Table %v not found", tableName)
-		http.Error(w, errStr, http.StatusNotFound)
+		result, err := json.Marshal(map[string]string{"error": "unknown table"})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		http.Error(w, string(result), http.StatusNotFound)
 		return
 	}
+
+	table := (*h.Tables)[tableIndex]
 
 	var limit int
 	var err error
@@ -96,8 +107,8 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	}
 
 	var offset int
-	offsetStr := r.URL.Query().Get("limit")
-	if limitStr == "" {
+	offsetStr := r.URL.Query().Get("offset")
+	if offsetStr == "" {
 		offset = OFFSET
 	} else {
 		offset, err = strconv.Atoi(offsetStr)
@@ -107,7 +118,7 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	}
 
 	var fieldNames []string
-	for _, field  := range table {
+	for _, field  := range table.Fields {
 		fieldNames = append(fieldNames, field.Field)
 	}
 
@@ -141,14 +152,15 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 }
 
 func (h *Handler) prepareValuesSlice(tableName string) []interface{} {
-	table, ok := (*h.Tables)[tableName]
+	tableIndex, ok := (*h.TablesHash)[tableName]
 	if !ok {
 		panic("Call unexisted table")
 	}
+	table := (*h.Tables)[tableIndex]
 
-	values := make([]interface{},len(table))
+	values := make([]interface{},len(table.Fields))
 
-	for idx, field := range table {
+	for idx, field := range table.Fields {
 		if field.Type == "int" {
 			values[idx] = reflect.New(reflect.PtrTo(reflect.TypeOf(int64(0)))).Interface()
 		} else if field.Type == "string" {
@@ -166,13 +178,14 @@ func (h *Handler) prepareValuesSlice(tableName string) []interface{} {
 }
 
 func (h *Handler) getValueFromInterface(tableName string, reflected interface{}, index int) interface{} {
-	table, ok := (*h.Tables)[tableName]
+	tableIndex, ok := (*h.TablesHash)[tableName]
 	if !ok {
 		panic("Call unexisted table")
 	}
+	table := (*h.Tables)[tableIndex]
 
 	pointer := reflect.Indirect(reflect.ValueOf(reflected)).Interface()
-	field := table[index]
+	field := table.Fields[index]
 
 	if field.Type == "int" {
 		if pointer.(*int64) == nil {
@@ -210,23 +223,26 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 		panic(err)
 	}
 
-	tables := make(map[string][]TableField)
+	tables := []Table{}
 	var table string
 	for rows.Next() {
 		rows.Scan(&table)
 
-		tables[table] = nil
+		tables = append(tables, Table{table, nil})
 	}
 	rows.Close()
 
-	for table := range tables {
-		rows, err := db.Query(fmt.Sprintf("SHOW COLUMNS FROM `%v`", table))
+	tablesHash := make(map[string]int, len(tables))
+	for index, table := range tables {
+		rows, err := db.Query(fmt.Sprintf("SHOW COLUMNS FROM `%v`", table.Table))
 		if err != nil {
 			panic(err)
 		}
 
 
-		tables[table] = fillFieldsDataSlice(rows, table)
+		table.Fields = fillFieldsDataSlice(rows, table.Table)
+		tables[index] = table
+		tablesHash[table.Table] = index
 	}
 
 	recordItemPathRegexp, _ := regexp.Compile(`^\/([A-Za-z1-9\_]+)\/(\d+)\/?$`)
@@ -234,7 +250,7 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 
 	siteMux := http.NewServeMux()
 
-	handler := &Handler{db, &tables, recordItemPathRegexp, recordsListPathRegexp}
+	handler := &Handler{db, &tables, &tablesHash, recordItemPathRegexp, recordsListPathRegexp}
 	siteMux.Handle("/", handler)
 
 	return siteMux, nil
