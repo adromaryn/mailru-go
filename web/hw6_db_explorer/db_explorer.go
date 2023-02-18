@@ -22,6 +22,7 @@ type TableField struct {
 
 type Table struct {
 	Table  string
+	PrimaryField string
 	Fields []TableField
 }
 
@@ -48,7 +49,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if r.Method == http.MethodGet {
-			h.getRecord(w, r, tableName, recordId)
+			h.getRecordItem(w, r, tableName, recordId)
 			return
 		} else {
 			result, _ := json.Marshal(map[string]string{"error": "method not supported"})
@@ -62,6 +63,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tableName := string(parsedPath[1])
 		if r.Method == http.MethodGet {
 			h.getTableRecordsList(w, r, tableName)
+			return
+		} else if r.Method == http.MethodPut {
+			h.addRecord(w, r, tableName)
 			return
 		} else {
 			result, _ := json.Marshal(map[string]string{"error": "method not supported"})
@@ -169,7 +173,7 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	}
 }
 
-func (h *Handler) getRecord(w http.ResponseWriter, r *http.Request, tableName string, recordId int) {
+func (h *Handler) getRecordItem(w http.ResponseWriter, r *http.Request, tableName string, recordId int) {
 	tableIndex, ok := (*h.TablesHash)[tableName]
 	if !ok {
 		result, _ := json.Marshal(map[string]string{"error": "unknown table"})
@@ -184,7 +188,10 @@ func (h *Handler) getRecord(w http.ResponseWriter, r *http.Request, tableName st
 		fieldNames = append(fieldNames, field.Field)
 	}
 
-	query := fmt.Sprintf("SELECT %v FROM %v WHERE id = ?", strings.Join(fieldNames, ", "), tableName)
+	query := fmt.Sprintf(
+		"SELECT %v FROM %v WHERE %v = ?",
+		strings.Join(fieldNames, ", "), tableName, table.PrimaryField,
+	)
 	row := h.DB.QueryRow(query, recordId)
 
 	result := make(map[string]interface{}, 0)
@@ -196,7 +203,7 @@ func (h *Handler) getRecord(w http.ResponseWriter, r *http.Request, tableName st
 		result[fieldName] = reflectValue
 	}
 
-	if result["id"] == nil {
+	if result[table.PrimaryField] == nil {
 		result, _ := json.Marshal(map[string]string{"error": "record not found"})
 		http.Error(w, string(result), http.StatusNotFound)
 		return
@@ -204,6 +211,67 @@ func (h *Handler) getRecord(w http.ResponseWriter, r *http.Request, tableName st
 
 	response := map[string]interface{}{"response": map[string]interface{}{"record": result}}
 	err := json.NewEncoder(w).Encode(response)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func (h *Handler) addRecord(w http.ResponseWriter, r *http.Request, tableName string) {
+	tableIndex, ok := (*h.TablesHash)[tableName]
+	if !ok {
+		result, _ := json.Marshal(map[string]string{"error": "unknown table"})
+		http.Error(w, string(result), http.StatusNotFound)
+		return
+	}
+
+	table := (*h.Tables)[tableIndex]
+
+	r.ParseForm()
+	var fieldNames []string
+	var paramsTemplates []string
+	var values []interface{}
+	for _, field := range table.Fields {
+		if field.Field == table.PrimaryField {
+			continue
+		}
+
+		if r.PostForm.Has(field.Field) {
+			fieldNames = append(fieldNames, field.Field)
+			value := r.FormValue(field.Field)
+			valueParsed, ok := validate(value, field)
+			if !ok {
+				result, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("field %v has invalid type", field.Field)})
+				http.Error(w, string(result), http.StatusBadRequest)
+				return
+			}
+
+			values = append(values, valueParsed)
+			paramsTemplates = append(paramsTemplates, "?")
+		}
+	}
+
+	query := fmt.Sprintf(
+		"INSERT INTO %v (%v) values (%v)",
+		tableName,
+		strings.Join(fieldNames, ","),
+		strings.Join(paramsTemplates, ","),
+	)
+
+	result, err := h.DB.Exec(query, values...)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	lastId, err := result.LastInsertId()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := map[string]interface{}{"response": map[string]interface{}{"record": lastId}}
+	err = json.NewEncoder(w).Encode(response)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -275,6 +343,32 @@ func (h *Handler) getValueFromInterface(tableName string, reflected interface{},
 	}
 }
 
+func validate (value string, field TableField) (valueParsed interface{}, ok bool) {
+	if field.Type == "int" {
+		valueParsed, err := strconv.Atoi(value)
+		if err != nil {
+			return nil, false
+		}
+		return valueParsed, true
+	} else if field.Type == "string" {
+		return value, true
+	} else if field.Type == "float" {
+		valueParsed, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return nil, false
+		}
+		return valueParsed, true
+	} else if field.Type == "bool" {
+		valueParsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, false
+		}
+		return valueParsed, true
+	} else {
+		panic("invalid field type")
+	}
+}
+
 func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 
 	rows, err := db.Query("SHOW tables")
@@ -287,7 +381,7 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 	for rows.Next() {
 		rows.Scan(&table)
 
-		tables = append(tables, Table{table, nil})
+		tables = append(tables, Table{table, "",nil})
 	}
 	rows.Close()
 
@@ -299,6 +393,15 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 		}
 
 		table.Fields = fillFieldsDataSlice(rows, table.Table)
+		for _, field := range table.Fields {
+			if field.Key == "PRI" {
+				table.PrimaryField = field.Field
+			}
+		}
+		if table.PrimaryField == "" {
+			panic("primary field required")
+		}
+
 		tables[index] = table
 		tablesHash[table.Table] = index
 	}
