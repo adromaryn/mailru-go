@@ -16,7 +16,7 @@ type TableField struct {
 	Type    string
 	Null    string
 	Key     string
-	Default string
+	Default interface{}
 	Extra   string
 }
 
@@ -53,6 +53,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if r.Method == http.MethodPost {
 			h.updateRecord(w, r, tableName, recordId)
+			return
+		} else if r.Method == http.MethodDelete {
+			h.deleteRecord(w, r, tableName, recordId)
 			return
 		} else {
 			result, _ := json.Marshal(map[string]string{"error": "method not supported"})
@@ -123,9 +126,7 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	} else {
 		limit, err = strconv.Atoi(limitStr)
 		if err != nil {
-			result, _ := json.Marshal(map[string]string{"error": "field limit have invalid type"})
-			http.Error(w, string(result), http.StatusBadRequest)
-			return
+			limit = LIMIT
 		}
 	}
 
@@ -136,9 +137,7 @@ func (h *Handler) getTableRecordsList(w http.ResponseWriter, r *http.Request, ta
 	} else {
 		offset, err = strconv.Atoi(offsetStr)
 		if err != nil {
-			result, _ := json.Marshal(map[string]string{"error": "field offset have invalid type"})
-			http.Error(w, string(result), http.StatusBadRequest)
-			return
+			offset = OFFSET
 		}
 	}
 
@@ -259,10 +258,18 @@ func (h *Handler) addRecord(w http.ResponseWriter, r *http.Request, tableName st
 			fieldNames = append(fieldNames, field.Field)
 			paramsTemplates = append(paramsTemplates, "?")
 		} else {
-			if field.Default == "NULL" && field.Null == "NO" {
-				result, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("field %v have invalid type", field.Field)})
-				http.Error(w, string(result), http.StatusBadRequest)
-				return
+			if field.Default == nil && field.Null == "NO" {
+				if field.Type == "int" {
+					values = append(values, 0)
+				} else if field.Type == "string" {
+					values = append(values, "")
+				} else if field.Type == "boolean" {
+					values = append(values, false)
+				} else if field.Type == "float" {
+					values = append(values, 0.0)
+				}
+				fieldNames = append(fieldNames, field.Field)
+				paramsTemplates = append(paramsTemplates, "?")
 			}
 		}
 	}
@@ -378,6 +385,42 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request, tableName
 	}
 
 	response := map[string]interface{}{"response": map[string]interface{}{"updated": affected}}
+	err = json.NewEncoder(w).Encode(response)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func (h *Handler) deleteRecord(w http.ResponseWriter, r *http.Request, tableName string, recordId int) {
+	tableIndex, ok := (*h.TablesHash)[tableName]
+	if !ok {
+		result, _ := json.Marshal(map[string]string{"error": "unknown table"})
+		http.Error(w, string(result), http.StatusNotFound)
+		return
+	}
+
+	table := (*h.Tables)[tableIndex]
+
+	query := fmt.Sprintf(
+		"DELETE FROM %v WHERE %v=?",
+		tableName,
+		table.PrimaryField,
+	)
+
+	result, err := h.DB.Exec(query, recordId)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := map[string]interface{}{"response": map[string]interface{}{"deleted": affected}}
 	err = json.NewEncoder(w).Encode(response)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
