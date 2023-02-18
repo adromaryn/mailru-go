@@ -21,9 +21,9 @@ type TableField struct {
 }
 
 type Table struct {
-	Table  string
+	Table        string
 	PrimaryField string
-	Fields []TableField
+	Fields       []TableField
 }
 
 type Handler struct {
@@ -343,7 +343,7 @@ func (h *Handler) getValueFromInterface(tableName string, reflected interface{},
 	}
 }
 
-func validate (value string, field TableField) (valueParsed interface{}, ok bool) {
+func validate(value string, field TableField) (valueParsed interface{}, ok bool) {
 	if field.Type == "int" {
 		valueParsed, err := strconv.Atoi(value)
 		if err != nil {
@@ -381,7 +381,7 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 	for rows.Next() {
 		rows.Scan(&table)
 
-		tables = append(tables, Table{table, "",nil})
+		tables = append(tables, Table{table, "", nil})
 	}
 	rows.Close()
 
